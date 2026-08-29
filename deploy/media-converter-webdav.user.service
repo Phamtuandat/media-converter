@@ -1,0 +1,19 @@
+[Unit]
+Description=Media Converter (WebDAV output user instance)
+Requires=media-webdav-user.service
+After=media-webdav-user.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/media-converter-webdav/media-converter-webdav.env
+ExecStartPre=/usr/bin/mountpoint -q %h/media-converter-webdav/mnt
+ExecStart=%h/media-converter-webdav/bin/media-converter serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/media-converter-webdav
+
+[Install]
+WantedBy=default.target

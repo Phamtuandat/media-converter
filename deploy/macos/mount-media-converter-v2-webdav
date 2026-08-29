@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+base="$HOME/Library/Application Support/media-converter-v2"
+env_file="$base/config/media-converter-v2.env"
+. "$env_file"
+
+mount_root="$base/mnt"
+mount_url="${WEBDAV_MOUNT_URL:?WEBDAV_MOUNT_URL is required}"
+mkdir -p "$mount_root"
+
+is_mounted() {
+    mount | grep -Fq " on $mount_root "
+}
+
+cleanup() {
+    if is_mounted; then
+        /sbin/umount "$mount_root" >/dev/null 2>&1 || true
+    fi
+}
+
+trap cleanup INT TERM EXIT
+if ! is_mounted; then
+    /sbin/mount_webdav "$mount_url" "$mount_root"
+fi
+while is_mounted; do
+    sleep 5
+done
+exit 1

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+base="$HOME/Library/Application Support/media-converter-v2"
+env_file="$base/config/media-converter-v2.env"
+if [ ! -r "$env_file" ]; then
+    echo "missing v2 environment: $env_file" >&2
+    exit 1
+fi
+
+set -a
+. "$env_file"
+set +a
+exec "$base/bin/media-converter-v2" "$@"

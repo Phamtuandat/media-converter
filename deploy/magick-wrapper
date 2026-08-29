@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+bin_dir="$root/usr/bin"
+lib_dir="$root/usr/lib/x86_64-linux-gnu"
+share_dir="$root/usr/share"
+module_dir=$(find "$lib_dir" -maxdepth 1 -type d -name 'ImageMagick-*' -print -quit)
+
+export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export MAGICK_HOME="$share_dir/ImageMagick-6"
+export MAGICK_CONFIGURE_PATH="$root/etc/ImageMagick-6:$module_dir/config-Q16"
+export MAGICK_CODER_MODULE_PATH="$module_dir/modules-Q16/coders"
+
+if [ "${1:-}" = "identify" ]; then
+    shift
+    exec "$bin_dir/identify-im6.q16" "$@"
+fi
+exec "$bin_dir/convert-im6.q16" "$@"

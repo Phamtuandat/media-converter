@@ -1,0 +1,13 @@
+[Unit]
+Description=Media Converter WebDAV output gateway (user instance)
+Requires=media-webdav-user.service
+After=media-webdav-user.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rclone serve webdav %h/media-converter-webdav/mnt --addr 100.64.131.36:8082 --read-only --dir-cache-time 0s --poll-interval 0 --log-level INFO
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

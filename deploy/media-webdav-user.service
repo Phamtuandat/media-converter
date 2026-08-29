@@ -1,0 +1,16 @@
+[Unit]
+Description=Media Converter WebDAV mount (user instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p %h/media-converter-webdav/mnt %h/media-converter-webdav/rclone-cache
+ExecStart=/usr/bin/rclone mount :webdav: %h/media-converter-webdav/mnt --webdav-url http://127.0.0.1:8080 --webdav-vendor rclone --vfs-cache-mode writes --cache-dir %h/media-converter-webdav/rclone-cache --dir-cache-time 30s --poll-interval 0 --log-level INFO
+ExecStop=/usr/bin/fusermount3 -u %h/media-converter-webdav/mnt
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+
+[Install]
+WantedBy=default.target

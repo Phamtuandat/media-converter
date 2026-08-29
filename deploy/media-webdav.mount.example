@@ -1,0 +1,17 @@
+# Example only. Adapt the What/Options values to the existing WebDAV/Caddy
+# endpoint and host credentials. Keep this mount unit separate from the
+# legacy rclone-webdav.service and use a separate cache directory.
+[Unit]
+Description=Media Converter WebDAV mount
+After=network-online.target caddy-webdav.service
+Wants=network-online.target
+Before=media-converter-webdav.service
+
+[Mount]
+What=:webdav:
+Where=/mnt/media-webdav
+Type=fuse.rclone
+Options=rw,allow_other,args2env,dir-cache-time=30s,vfs-cache-mode=writes,cache-dir=/var/cache/rclone/media-converter-webdav
+
+[Install]
+WantedBy=multi-user.target

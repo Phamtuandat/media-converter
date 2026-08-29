@@ -1,0 +1,19 @@
+[Unit]
+Description=Media Converter v2 writable WebDAV gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dat
+Group=dat
+EnvironmentFile=/etc/media-converter/media-converter-mac-v2-writer.env
+ExecStart=/opt/media-converter/bin/media-converter-mac-v2-writer
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/media-converter-mac-v2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Load only after unloading the old service; the label is intentional. -->
+	<key>Label</key>
+	<string>com.datpham.media-converter</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/REPLACE_ME/Library/Application Support/media-converter-v2/bin/run-media-converter-v2</string>
+		<string>serve</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/REPLACE_ME/Library/Application Support/media-converter-v2</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/REPLACE_ME/Library/Application Support/media-converter-v2/state/service.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/REPLACE_ME/Library/Application Support/media-converter-v2/state/service.error.log</string>
+</dict>
+</plist>

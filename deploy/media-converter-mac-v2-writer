@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+env_file=${MEDIA_CONVERTER_WRITER_ENV:-/etc/media-converter/media-converter-mac-v2-writer.env}
+. "$env_file"
+
+mkdir -p "$WEBDAV_ROOT/media-converter-v2/artifacts"
+
+set -- /usr/bin/rclone serve webdav "$WEBDAV_ROOT" \
+  --addr "$WEBDAV_ADDR" \
+  --dir-cache-time 5s \
+  --poll-interval 0 \
+  --log-level INFO
+
+if [ -n "${WEBDAV_USER:-}" ] && [ -n "${WEBDAV_PASS:-}" ]; then
+    set -- "$@" --user "$WEBDAV_USER" --pass "$WEBDAV_PASS"
+fi
+exec "$@"
