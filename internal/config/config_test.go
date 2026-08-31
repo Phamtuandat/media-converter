@@ -22,6 +22,24 @@ func TestLoadDefaultsToLocalOutput(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsLoopbackListenAddr(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LISTEN_ADDR", "127.0.0.1:8080")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("loopback listen address rejected: %v", err)
+	}
+}
+
+func TestLoadRejectsUnspecifiedListenAddr(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LISTEN_ADDR", "0.0.0.0:8080")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected unspecified listen address to be rejected")
+	}
+}
+
 func TestLoadWebDAVOutputRequiresDirectBaseURL(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("MEDIA_OUTPUT_MODE", OutputModeWebDAV)

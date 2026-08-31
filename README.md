@@ -128,11 +128,12 @@ deploy/
 - ImageMagick delegates for HEIC/HEIF, AVIF, and WebP.
 - A writable persistent location for staging, output, state, cache, and work
   data.
-- A private or Tailscale IPv4 address for the listening interface.
+- A loopback, private, or Tailscale address for the listening interface.
 
-The default configuration rejects loopback and unspecified listen addresses.
-Use a literal private/Tailscale IP such as 192.168.1.20 or a Tailscale address
-in the 100.64.0.0/10 range. Do not use 127.0.0.1 or 0.0.0.0.
+The default configuration accepts loopback and private/Tailscale listen
+addresses, but rejects unspecified addresses. Use 127.0.0.1 when all clients
+run on the same host; otherwise use a literal private/Tailscale IP such as
+192.168.1.20 or an address in the 100.64.0.0/10 range. Do not use 0.0.0.0.
 
 ### Install tool examples
 
@@ -276,7 +277,7 @@ LaunchAgent wrapper scripts are external to the Go process.
 
 | Variable | Required/default | Description |
 | --- | --- | --- |
-| LISTEN_ADDR | Required | Literal host:port using a non-loopback private/Tailscale IPv4 address. |
+| LISTEN_ADDR | Required | Literal host:port using a loopback, private, or Tailscale address. |
 | MEDIA_SERVICE_TOKEN | Required | Bearer token required by artifact, job, download, and metrics endpoints. Keep it outside Git. |
 | PUBLIC_BASE_URL | Empty | Absolute HTTP(S) base URL used for local-mode download URLs. No query string or fragment. |
 | MEDIA_OUTPUT_MODE | local | Must be local or webdav. |
@@ -896,8 +897,9 @@ Set LISTEN_ADDR before starting the process:
 export LISTEN_ADDR="100.64.0.10:8080"
 ~~~
 
-Use a literal private/Tailscale IP. Loopback and unspecified addresses are
-rejected by configuration validation.
+Use 127.0.0.1 for a same-host deployment, or a literal private/Tailscale IP
+when other hosts need access. Unspecified addresses are rejected by
+configuration validation.
 
 ### /health/ready returns 503
 

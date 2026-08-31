@@ -119,7 +119,7 @@ func Load() (Config, error) {
 		ToolFingerprint:          env("TOOL_FINGERPRINT", ""),
 	}
 	if c.ListenAddr == "" {
-		return Config{}, fmt.Errorf("LISTEN_ADDR is required; bind the service to its Tailscale address")
+		return Config{}, fmt.Errorf("LISTEN_ADDR is required; bind the service to a loopback, private, or Tailscale address")
 	}
 	if c.BearerToken == "" {
 		return Config{}, fmt.Errorf("MEDIA_SERVICE_TOKEN is required")
@@ -181,11 +181,11 @@ func validateBaseURL(name, value string, required bool) error {
 func validateListenAddr(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || host == "" {
-		return fmt.Errorf("LISTEN_ADDR must be host:port on a private/Tailscale interface")
+		return fmt.Errorf("LISTEN_ADDR must be host:port on a loopback, private, or Tailscale interface")
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || (!ip.IsPrivate() && !isTailscaleAddress(ip)) {
-		return fmt.Errorf("LISTEN_ADDR must use a non-loopback private/Tailscale address")
+	if ip == nil || ip.IsUnspecified() || (!ip.IsLoopback() && !ip.IsPrivate() && !isTailscaleAddress(ip)) {
+		return fmt.Errorf("LISTEN_ADDR must use a loopback, private, or Tailscale address")
 	}
 	return nil
 }
