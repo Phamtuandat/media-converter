@@ -31,6 +31,26 @@ type Metrics struct {
 	statuses   map[string]int64
 	operations map[string]int64
 	errors     map[string]int64
+	phaseCount map[string]int64
+	phaseNS    map[string]int64
+}
+
+const (
+	PhaseQueue       = "queue"
+	PhaseStateIO     = "state_io"
+	PhaseDetectProbe = "detect_probe"
+	PhaseProcessing  = "processing"
+	PhaseValidation  = "validation"
+	PhaseCommit      = "commit"
+)
+
+var phaseNames = []string{
+	PhaseQueue,
+	PhaseStateIO,
+	PhaseDetectProbe,
+	PhaseProcessing,
+	PhaseValidation,
+	PhaseCommit,
 }
 
 func NewMetrics() *Metrics {
@@ -39,6 +59,8 @@ func NewMetrics() *Metrics {
 		statuses:   make(map[string]int64),
 		operations: make(map[string]int64),
 		errors:     make(map[string]int64),
+		phaseCount: makePhaseMap(),
+		phaseNS:    makePhaseMap(),
 	}
 }
 
@@ -78,6 +100,19 @@ func (m *Metrics) RecordItem(status, operation, errorCode string, inputBytes, ou
 	m.mu.Unlock()
 }
 
+func (m *Metrics) RecordPhase(phase string, duration time.Duration) {
+	if !knownPhase(phase) {
+		return
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	m.mu.Lock()
+	m.phaseCount[phase]++
+	m.phaseNS[phase] += duration.Nanoseconds()
+	m.mu.Unlock()
+}
+
 func (m *Metrics) RecordError(code string) {
 	if code == "" {
 		return
@@ -111,6 +146,8 @@ func (m *Metrics) Prometheus() string {
 	statuses := copyMap(m.statuses)
 	operations := copyMap(m.operations)
 	errors := copyMap(m.errors)
+	phaseCount := copyMap(m.phaseCount)
+	phaseNS := copyMap(m.phaseNS)
 	m.mu.Unlock()
 
 	var b strings.Builder
@@ -131,7 +168,26 @@ func (m *Metrics) Prometheus() string {
 	writeLabeledCounters(&b, "media_converter_items_total", "status", statuses)
 	writeLabeledCounters(&b, "media_converter_operations_total", "operation", operations)
 	writeLabeledCounters(&b, "media_converter_errors_total", "code", errors)
+	writeLabeledCounters(&b, "media_converter_phase_duration_seconds_count", "phase", phaseCount)
+	writeLabeledDurationSums(&b, "media_converter_phase_duration_seconds_sum", "phase", phaseNS)
 	return b.String()
+}
+
+func makePhaseMap() map[string]int64 {
+	result := make(map[string]int64, len(phaseNames))
+	for _, phase := range phaseNames {
+		result[phase] = 0
+	}
+	return result
+}
+
+func knownPhase(phase string) bool {
+	for _, name := range phaseNames {
+		if phase == name {
+			return true
+		}
+	}
+	return false
 }
 
 func copyMap(source map[string]int64) map[string]int64 {
@@ -158,5 +214,16 @@ func writeLabeledCounters(b *strings.Builder, name, label string, values map[str
 	sort.Strings(keys)
 	for _, key := range keys {
 		fmt.Fprintf(b, "%s{%s=%q} %d\n", name, label, key, values[key])
+	}
+}
+
+func writeLabeledDurationSums(b *strings.Builder, name, label string, values map[string]int64) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fmt.Fprintf(b, "%s{%s=%q} %.6f\n", name, label, key, float64(values[key])/float64(time.Second))
 	}
 }

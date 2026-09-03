@@ -33,11 +33,6 @@ func (p Pipeline) Process(ctx context.Context, input, output string, policy doma
 	if _, err := p.FFmpeg.RunWithOutputLimit(ctx, output, p.MaxOutputBytes, args...); err != nil {
 		return "", detected, domain.NewError("converter_failed", "FFmpeg audio conversion failed", "audio", false, err)
 	}
-	metadata, err := p.Validate(ctx, output, policy.TargetAudio)
-	if err != nil {
-		return "", detected, err
-	}
-	_ = metadata
 	return domain.OperationTranscoded, detected, nil
 }
 

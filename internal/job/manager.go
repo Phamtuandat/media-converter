@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,7 @@ type Manager struct {
 	cancel    context.CancelFunc
 	metrics   *observability.Metrics
 	logger    *slog.Logger
+	queueAt   sync.Map
 }
 
 type StateStore interface {
@@ -90,6 +92,15 @@ func (p *progressTracker) snapshot() domain.JobRecord {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.record
+}
+
+func (p *progressTracker) hasCommittedResult(index int, result domain.ItemResult) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.record.Progress) || p.record.Progress[index].State != domain.ProgressCommitted || p.record.Progress[index].Result == nil {
+		return false
+	}
+	return reflect.DeepEqual(*p.record.Progress[index].Result, result)
 }
 
 func NewManager(cfg config.Config, store *storage.LocalStore, states StateStore, caches ...*cache.Store) *Manager {
@@ -136,7 +147,9 @@ func (m *Manager) Start() {
 }
 
 func (m *Manager) Recover(ctx context.Context) error {
+	stateStarted := time.Now()
 	records, err := m.states.List(ctx)
+	m.recordPhase(observability.PhaseStateIO, stateStarted)
 	if err != nil {
 		m.metrics.RecordRecovery(err)
 		return err
@@ -169,11 +182,13 @@ func (m *Manager) Recover(ctx context.Context) error {
 		if record.State != domain.JobQueued {
 			continue
 		}
+		m.queueAt.Store(record.JobID, time.Now())
 		select {
 		case m.queue <- record.JobID:
 			m.metrics.SetQueueDepth(len(m.queue))
 			m.logger.Info("job_recovered", "job_id", record.JobID, "state", record.State)
 		case <-ctx.Done():
+			m.queueAt.Delete(record.JobID)
 			m.metrics.RecordRecovery(ctx.Err())
 			return ctx.Err()
 		}
@@ -198,7 +213,7 @@ func (m *Manager) reconcileProgress(ctx context.Context, record domain.JobRecord
 			}
 			continue
 		}
-		result, err := m.reconcileItem(ctx, progress)
+		result, err := m.reconcileItemWithPolicy(ctx, progress, record.Request.Policy.TargetAudio)
 		if err != nil {
 			results[index] = domain.ItemResult{ID: item.ID, Status: domain.ItemFailed, Error: asProcessingError(domain.NewError("output_validation_failed", "committed artifact failed recovery validation", "recovery", false, err))}
 			continue
@@ -215,6 +230,10 @@ func recoveryInterrupted(id string) domain.ItemResult {
 }
 
 func (m *Manager) reconcileItem(ctx context.Context, progress domain.ItemProgress) (domain.ItemResult, error) {
+	return m.reconcileItemWithPolicy(ctx, progress, "")
+}
+
+func (m *Manager) reconcileItemWithPolicy(ctx context.Context, progress domain.ItemProgress, audioPolicy string) (domain.ItemResult, error) {
 	result := domain.ItemResult{ID: progress.ID, Status: domain.ItemSuccess, Operation: progress.Operation, Input: progress.Input, Detected: progress.Detected}
 	if progress.Result != nil {
 		result = *progress.Result
@@ -253,9 +272,11 @@ func (m *Manager) reconcileItem(ctx context.Context, progress domain.ItemProgres
 	} else {
 		var metadata domain.OutputMetadata
 		if progress.Kind == "image" {
-			metadata, err = m.images.Validate(ctx, artifact.Path)
+			metadata, err = m.validateImageOutput(ctx, artifact.Path)
+		} else if progress.Kind == "audio" {
+			metadata, err = m.validateAudioOutput(ctx, artifact.Path, audioPolicy)
 		} else {
-			metadata, err = m.videos.Validate(ctx, artifact.Path)
+			metadata, err = m.validateVideoOutput(ctx, artifact.Path)
 		}
 		if err != nil {
 			return domain.ItemResult{}, err
@@ -307,6 +328,8 @@ func mimeForKind(kind string) string {
 }
 
 func (m *Manager) validateCommittedOutput(ctx context.Context, output *domain.OutputMetadata) error {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseValidation, started)
 	artifact, err := m.store.OpenCommitted(ctx, output.ArtifactID)
 	if err != nil {
 		return err
@@ -322,6 +345,8 @@ func (m *Manager) validateCommittedOutput(ctx context.Context, output *domain.Ou
 }
 
 func (m *Manager) validateCommittedThumbnail(ctx context.Context, thumbnail *domain.ThumbnailMetadata) error {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseValidation, started)
 	artifact, err := m.store.OpenCommitted(ctx, thumbnail.ArtifactID)
 	if err != nil {
 		return err
@@ -334,6 +359,30 @@ func (m *Manager) validateCommittedThumbnail(ctx context.Context, thumbnail *dom
 		return fmt.Errorf("thumbnail hash or size mismatch")
 	}
 	return nil
+}
+
+func (m *Manager) validateImageOutput(ctx context.Context, path string) (domain.OutputMetadata, error) {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseValidation, started)
+	return m.images.Validate(ctx, path)
+}
+
+func (m *Manager) validateVideoOutput(ctx context.Context, path string) (domain.OutputMetadata, error) {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseValidation, started)
+	return m.videos.Validate(ctx, path)
+}
+
+func (m *Manager) validateAudioOutput(ctx context.Context, path, policy string) (domain.OutputMetadata, error) {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseValidation, started)
+	return m.audio.Validate(ctx, path, policy)
+}
+
+func (m *Manager) recordPhase(phase string, started time.Time) {
+	duration := time.Since(started)
+	m.metrics.RecordPhase(phase, duration)
+	m.logger.Debug("phase_duration", "phase", phase, "duration_ms", duration.Milliseconds())
 }
 
 func (m *Manager) SetLogger(logger *slog.Logger) {
@@ -367,6 +416,7 @@ func (m *Manager) Submit(ctx context.Context, request domain.JobRequest) (domain
 		m.metrics.RecordError("storage_write_failed")
 		return domain.JobRecord{}, false, err
 	}
+	m.queueAt.Store(request.JobID, time.Now())
 	select {
 	case m.queue <- request.JobID:
 		m.metrics.IncJobSubmitted()
@@ -374,6 +424,7 @@ func (m *Manager) Submit(ctx context.Context, request domain.JobRequest) (domain
 		m.logger.Info("job_queued", "job_id", record.JobID, "item_count", len(record.Request.Items))
 		return record, false, nil
 	default:
+		m.queueAt.Delete(request.JobID)
 		m.metrics.IncQueueRejected()
 		m.logger.Warn("job_rejected", "job_id", record.JobID, "reason", "queue_full")
 		if err := m.states.Delete(ctx, request.JobID); err != nil {
@@ -485,6 +536,13 @@ func (m *Manager) worker() {
 		case <-m.ctx.Done():
 			return
 		case jobID := <-m.queue:
+			queueStarted := time.Now()
+			if value, ok := m.queueAt.LoadAndDelete(jobID); ok {
+				if started, ok := value.(time.Time); ok {
+					queueStarted = started
+				}
+			}
+			m.recordPhase(observability.PhaseQueue, queueStarted)
 			m.metrics.SetQueueDepth(len(m.queue))
 			m.processJob(jobID)
 		}
@@ -495,7 +553,9 @@ func (m *Manager) processJob(jobID string) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(m.ctx, m.cfg.JobTimeout)
 	defer cancel()
+	stateStarted := time.Now()
 	record, err := m.states.Get(ctx, jobID)
+	m.recordPhase(observability.PhaseStateIO, stateStarted)
 	if err != nil {
 		m.logger.Error("job_load_failed", "job_id", jobID, "error", err)
 		m.metrics.RecordError("state_read_failed")
@@ -536,25 +596,7 @@ func (m *Manager) processJob(jobID string) {
 					progress.State = domain.ProgressProcessing
 				})
 				item.result = m.processItem(ctx, record, record.Request.Items[item.index], item.index, budget, tracker)
-				_ = tracker.update(context.Background(), item.index, func(progress *domain.ItemProgress) {
-					progress.Result = &item.result
-					progress.Input = item.result.Input
-					progress.Detected = item.result.Detected
-					progress.Operation = item.result.Operation
-					if item.result.Output != nil {
-						progress.OutputArtifactID = item.result.Output.ArtifactID
-					}
-					if item.result.Thumbnail != nil {
-						progress.ThumbnailArtifactID = item.result.Thumbnail.ArtifactID
-					}
-					if item.result.Status == domain.ItemSuccess {
-						progress.State = domain.ProgressCommitted
-					} else if item.result.Status == domain.ItemRejected {
-						progress.State = domain.ProgressRejected
-					} else {
-						progress.State = domain.ProgressFailed
-					}
-				})
+				_ = m.persistItemProgress(context.Background(), tracker, item.index, item.result)
 				m.metrics.RecordItem(string(item.result.Status), string(item.result.Operation), errorCode(item.result.Error), inputSize(item.result.Input), outputSize(item.result.Output))
 				m.logger.Info("job_item_completed", "job_id", record.JobID, "item_id", item.result.ID, "input_sha256", inputHash(item.result.Input), "detected_format", detectedFormat(item.result.Detected), "status", item.result.Status, "operation", item.result.Operation, "input_size", inputSize(item.result.Input), "output_size", outputSize(item.result.Output), "error_code", errorCode(item.result.Error))
 				resultCh <- item
@@ -584,6 +626,8 @@ func (m *Manager) processJob(jobID string) {
 }
 
 func (m *Manager) persistState(parent context.Context, record domain.JobRecord) error {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseStateIO, started)
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	var err error
@@ -639,6 +683,34 @@ func (b *jobBudget) reserveMedia(pixels int64, duration time.Duration, pixelLimi
 	return false
 }
 
+func (m *Manager) detectMedia(ctx context.Context, path string) (detected domain.MediaDetected, err error) {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseDetectProbe, started)
+
+	detected, err = m.detector.Detect(ctx, path, m.cfg.MaxInputBytes)
+	probed := false
+	if err != nil {
+		var detectionErr *domain.Error
+		if errors.As(err, &detectionErr) && detectionErr.Code == "unsupported_format" {
+			detected, err = m.videos.Probe.Probe(ctx, path)
+			probed = true
+		}
+	}
+	if err != nil {
+		return domain.MediaDetected{}, err
+	}
+	if !probed && (detected.Kind == "video" || detected.Kind == "audio") {
+		probedMedia, probeErr := m.videos.Probe.Probe(ctx, path)
+		if probeErr != nil {
+			return domain.MediaDetected{}, probeErr
+		}
+		probedMedia.Container = detected.Container
+		probedMedia.MIME = detected.MIME
+		detected = probedMedia
+	}
+	return detected, nil
+}
+
 func (m *Manager) processItem(ctx context.Context, record domain.JobRecord, item domain.Item, index int, budget *jobBudget, tracker *progressTracker) domain.ItemResult {
 	result := domain.ItemResult{ID: item.ID, Status: domain.ItemFailed}
 	workspace, err := storage.NewWorkspace(m.cfg.WorkRoot, record.JobID, fmt.Sprintf("%03d-%s", index, item.ID))
@@ -676,26 +748,10 @@ func (m *Manager) processItem(ctx context.Context, record domain.JobRecord, item
 		result.Error = asProcessingError(domain.NewError("input_hash_mismatch", "input SHA-256 does not match expected hash", "hash", false, nil))
 		return result
 	}
-	detected, err := m.detector.Detect(ctx, inputPath, m.cfg.MaxInputBytes)
-	if err != nil {
-		var detectionErr *domain.Error
-		if errors.As(err, &detectionErr) && detectionErr.Code == "unsupported_format" {
-			detected, err = m.videos.Probe.Probe(ctx, inputPath)
-		}
-	}
+	detected, err := m.detectMedia(ctx, inputPath)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
-	}
-	if detected.Kind == "video" || detected.Kind == "audio" {
-		probed, probeErr := m.videos.Probe.Probe(ctx, inputPath)
-		if probeErr != nil {
-			result.Status, result.Error = statusError(probeErr)
-			return result
-		}
-		probed.Container = detected.Container
-		probed.MIME = detected.MIME
-		detected = probed
 	}
 	result.Detected = &detected
 	if detected.Kind == "audio" && !supportedAudioInput(detected) {
@@ -739,6 +795,32 @@ func (m *Manager) processItem(ctx context.Context, record domain.JobRecord, item
 	return m.processVideo(ctx, record, result, inputPath, detected, workspace.Path, tracker, index)
 }
 
+func (m *Manager) persistItemProgress(ctx context.Context, tracker *progressTracker, index int, result domain.ItemResult) error {
+	if result.Status == domain.ItemSuccess && tracker.hasCommittedResult(index, result) {
+		return nil
+	}
+	return tracker.update(ctx, index, func(progress *domain.ItemProgress) {
+		progress.Result = &result
+		progress.Input = result.Input
+		progress.Detected = result.Detected
+		progress.Operation = result.Operation
+		if result.Output != nil {
+			progress.OutputArtifactID = result.Output.ArtifactID
+		}
+		if result.Thumbnail != nil {
+			progress.ThumbnailArtifactID = result.Thumbnail.ArtifactID
+		}
+		switch result.Status {
+		case domain.ItemSuccess:
+			progress.State = domain.ProgressCommitted
+		case domain.ItemRejected:
+			progress.State = domain.ProgressRejected
+		default:
+			progress.State = domain.ProgressFailed
+		}
+	})
+}
+
 func (m *Manager) processImage(ctx context.Context, record domain.JobRecord, result domain.ItemResult, input string, detected domain.MediaDetected, workspace string, tracker *progressTracker, index int) domain.ItemResult {
 	select {
 	case m.imageSem <- struct{}{}:
@@ -748,12 +830,14 @@ func (m *Manager) processImage(ctx context.Context, record domain.JobRecord, res
 		return result
 	}
 	out := filepath.Join(workspace, "output.jpg")
+	processingStarted := time.Now()
 	operation, _, err := m.images.Process(ctx, input, out, record.Request.Policy)
+	m.recordPhase(observability.PhaseProcessing, processingStarted)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
 	}
-	metadata, err := m.images.Validate(ctx, out)
+	metadata, err := m.validateImageOutput(ctx, out)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
@@ -776,12 +860,14 @@ func (m *Manager) processVideo(ctx context.Context, record domain.JobRecord, res
 		return result
 	}
 	out := filepath.Join(workspace, "output.mp4")
+	processingStarted := time.Now()
 	operation, _, err := m.videos.Process(ctx, input, out, detected)
+	m.recordPhase(observability.PhaseProcessing, processingStarted)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
 	}
-	metadata, err := m.videos.Validate(ctx, out)
+	metadata, err := m.validateVideoOutput(ctx, out)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
@@ -847,12 +933,14 @@ func (m *Manager) processAudio(ctx context.Context, record domain.JobRecord, res
 		return result
 	}
 	out := filepath.Join(workspace, "output"+audioExtension(record.Request.Policy.TargetAudio))
+	processingStarted := time.Now()
 	operation, _, err := m.audio.Process(ctx, input, out, record.Request.Policy, detected)
+	m.recordPhase(observability.PhaseProcessing, processingStarted)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
 	}
-	metadata, err := m.audio.Validate(ctx, out, record.Request.Policy.TargetAudio)
+	metadata, err := m.validateAudioOutput(ctx, out, record.Request.Policy.TargetAudio)
 	if err != nil {
 		result.Status, result.Error = statusError(err)
 		return result
@@ -967,6 +1055,8 @@ func extensionMismatch(artifactID string, detected domain.MediaDetected) bool {
 }
 
 func (m *Manager) commitResult(ctx context.Context, result domain.ItemResult, operation domain.Operation, output string, metadata domain.OutputMetadata, kind string, tracker *progressTracker, index int) domain.ItemResult {
+	started := time.Now()
+	defer m.recordPhase(observability.PhaseCommit, started)
 	id := storage.NewArtifactID("norm")
 	_ = tracker.update(context.Background(), index, func(progress *domain.ItemProgress) {
 		progress.Kind = kind
@@ -1013,7 +1103,10 @@ func (m *Manager) commitResult(ctx context.Context, result domain.ItemResult, op
 	if err := tracker.update(context.Background(), index, func(progress *domain.ItemProgress) {
 		progress.Kind = kind
 		progress.Operation = operation
+		progress.Input = result.Input
+		progress.Detected = result.Detected
 		progress.OutputArtifactID = metadata.ArtifactID
+		progress.State = domain.ProgressCommitted
 		progress.Result = &result
 	}); err != nil {
 		result.Status = domain.ItemFailed

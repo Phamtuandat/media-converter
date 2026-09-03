@@ -60,11 +60,6 @@ func (p Pipeline) Process(ctx context.Context, input, output string, detected do
 			return "", detected, domain.NewError("converter_failed", "FFmpeg transcode failed", "video", false, err)
 		}
 	}
-	metadata, err := p.Validate(ctx, output)
-	if err != nil {
-		return "", detected, err
-	}
-	_ = metadata
 	return operation, detected, nil
 }
 

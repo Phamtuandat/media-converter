@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"media-converter-v2/internal/cache"
 	"media-converter-v2/internal/config"
 	"media-converter-v2/internal/domain"
 	"media-converter-v2/internal/processor"
@@ -21,6 +24,7 @@ import (
 type failingStateStore struct {
 	base     *state.Store
 	failFrom int
+	mu       sync.Mutex
 	puts     int
 }
 
@@ -29,11 +33,303 @@ func (s *failingStateStore) Get(ctx context.Context, jobID string) (domain.JobRe
 }
 
 func (s *failingStateStore) Put(ctx context.Context, record domain.JobRecord) error {
+	s.mu.Lock()
 	s.puts++
-	if s.failFrom > 0 && s.puts >= s.failFrom {
+	puts := s.puts
+	s.mu.Unlock()
+	if s.failFrom > 0 && puts >= s.failFrom {
 		return errors.New("injected state write failure")
 	}
 	return s.base.Put(ctx, record)
+}
+
+type countingStateStore struct {
+	base *state.Store
+	mu   sync.Mutex
+	puts int
+}
+
+func (s *countingStateStore) Get(ctx context.Context, jobID string) (domain.JobRecord, error) {
+	return s.base.Get(ctx, jobID)
+}
+
+func (s *countingStateStore) Put(ctx context.Context, record domain.JobRecord) error {
+	s.mu.Lock()
+	s.puts++
+	s.mu.Unlock()
+	return s.base.Put(ctx, record)
+}
+
+func (s *countingStateStore) PutCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.puts
+}
+
+func (s *countingStateStore) Delete(ctx context.Context, jobID string) error {
+	return s.base.Delete(ctx, jobID)
+}
+
+func (s *countingStateStore) List(ctx context.Context) ([]domain.JobRecord, error) {
+	return s.base.List(ctx)
+}
+
+func (s *countingStateStore) CleanupOld(ctx context.Context, age time.Duration) error {
+	return s.base.CleanupOld(ctx, age)
+}
+
+func TestCommittedItemSkipsRedundantTerminalProgressWrite(t *testing.T) {
+	store, err := storage.NewLocalStore(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseStates, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := &countingStateStore{base: baseStates}
+	manager := NewManager(config.Config{
+		QueueSize: 1, JobWorkers: 1, ImageWorkers: 1, VideoWorkers: 1,
+		WorkRoot: t.TempDir(), MaxOutputBytes: 1024,
+	}, store, states)
+	defer manager.Stop()
+
+	record := domain.JobRecord{
+		JobID:    "committed-write-count",
+		State:    domain.JobProcessing,
+		Progress: []domain.ItemProgress{{ID: "item", State: domain.ProgressProcessing}},
+	}
+	tracker := newProgressTracker(manager, record)
+	output := filepath.Join(t.TempDir(), "output.jpg")
+	if err := os.WriteFile(output, []byte("committed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := domain.ItemResult{
+		ID: "item", Status: domain.ItemSuccess, Operation: domain.OperationNormalized,
+		Output: &domain.OutputMetadata{Extension: ".jpg", MIME: "image/jpeg"},
+	}
+	result = manager.commitResult(context.Background(), result, domain.OperationNormalized, output, *result.Output, "image", tracker, 0)
+	if result.Status != domain.ItemSuccess {
+		t.Fatalf("commit failed: %+v", result)
+	}
+	if got := states.PutCount(); got != 2 {
+		t.Fatalf("commit should persist planned and committed checkpoints, got %d writes", got)
+	}
+	if err := manager.persistItemProgress(context.Background(), tracker, 0, result); err != nil {
+		t.Fatal(err)
+	}
+	if got := states.PutCount(); got != 2 {
+		t.Fatalf("committed item got redundant terminal progress write, got %d writes", got)
+	}
+
+	for _, test := range []struct {
+		jobID  string
+		status domain.ItemStatus
+	}{
+		{jobID: "cache-hit-write-count", status: domain.ItemSuccess},
+		{jobID: "rejected-write-count", status: domain.ItemRejected},
+		{jobID: "failed-write-count", status: domain.ItemFailed},
+	} {
+		tracker := newProgressTracker(manager, domain.JobRecord{
+			JobID: test.jobID, State: domain.JobProcessing,
+			Progress: []domain.ItemProgress{{ID: "item", State: domain.ProgressProcessing}},
+		})
+		if err := manager.persistItemProgress(context.Background(), tracker, 0, domain.ItemResult{ID: "item", Status: test.status}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := states.PutCount(); got != 5 {
+		t.Fatalf("cache-hit/rejected/failed paths should each persist terminal progress, got %d writes", got)
+	}
+}
+
+func TestCacheHitPersistsTerminalProgress(t *testing.T) {
+	magick := writeJobExecutable(t, "#!/bin/sh\nprintf '10|10|1|sRGB\\n'\n")
+	inputRoot, outputRoot, stateRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	store, err := storage.NewLocalStore(inputRoot, outputRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputPath := filepath.Join(inputRoot, "input.jpg")
+	if err := os.WriteFile(inputPath, []byte{0xff, 0xd8, 0xff, 'i', 'n', 'p', 'u', 't'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseStates, err := state.NewStore(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := &countingStateStore{base: baseStates}
+	resultCache, err := cache.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(config.Config{
+		MagickPath: magick, QueueSize: 1, JobWorkers: 1, ImageWorkers: 1, VideoWorkers: 1,
+		WorkRoot: t.TempDir(), MaxInputBytes: 1024, MaxOutputBytes: 1024,
+		MaxWidth: 100, MaxHeight: 100, MaxPixels: 10000,
+	}, store, states, resultCache)
+	defer manager.Stop()
+
+	request := domain.JobRequest{JobID: "cache-hit", Items: []domain.Item{{ID: "item", ArtifactID: "input.jpg"}}, Policy: domain.DefaultPolicy()}
+	detected := domain.MediaDetected{Kind: "image", Format: "jpeg", MIME: "image/jpeg", Width: 10, Height: 10}
+	hash, size, err := processor.HashFile(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final, tmp, err := store.Begin(context.Background(), "norm-cache", ".jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("cached-output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := store.Commit(context.Background(), tmp, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputHash, outputSize, err := processor.HashFile(committed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := manager.cacheKey(hash, detected, request.Policy)
+	if err := resultCache.Put(context.Background(), key, map[string]any{"result": domain.ItemResult{
+		ID: "item", Status: domain.ItemSuccess, Operation: domain.OperationNormalized,
+		Output: &domain.OutputMetadata{ArtifactID: committed.ID, Extension: ".jpg", MIME: "image/jpeg", Size: outputSize, SHA256: outputHash},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if size == 0 {
+		t.Fatal("input fixture should not be empty")
+	}
+
+	record := domain.JobRecord{JobID: request.JobID, Request: request, Progress: []domain.ItemProgress{{ID: "item", State: domain.ProgressProcessing}}}
+	tracker := newProgressTracker(manager, record)
+	result := manager.processItem(context.Background(), record, request.Items[0], 0, &jobBudget{}, tracker)
+	if result.Status != domain.ItemSuccess || result.Output == nil || result.Output.ArtifactID != committed.ID {
+		t.Fatalf("expected cached result, got %+v", result)
+	}
+	if err := manager.persistItemProgress(context.Background(), tracker, 0, result); err != nil {
+		t.Fatal(err)
+	}
+	if got := states.PutCount(); got != 1 {
+		t.Fatalf("cache hit should persist one terminal progress checkpoint, got %d writes", got)
+	}
+	if got, err := baseStates.Get(context.Background(), request.JobID); err != nil || len(got.Progress) != 1 || got.Progress[0].State != domain.ProgressCommitted {
+		t.Fatalf("cache-hit progress was not committed: %+v, %v", got, err)
+	}
+}
+
+func TestSuccessfulImageJobPersistsOneCommittedProgressCheckpoint(t *testing.T) {
+	magick := writeJobExecutable(t, `#!/bin/sh
+if [ "$1" = "identify" ]; then
+    case "$3" in
+        *channels*) printf 'JPEG|10|10|sRGB|RGB\n' ;;
+        *%m*) printf 'JPEG|10|10|1|sRGB\n' ;;
+        *) printf '10|10|1|sRGB\n' ;;
+    esac
+    exit 0
+fi
+last=""
+for arg do last="$arg"; done
+case "$last" in
+    jpg:*) printf 'fake-jpeg' > "${last#jpg:}" ;;
+esac
+`)
+	inputRoot, outputRoot := t.TempDir(), t.TempDir()
+	store, err := storage.NewLocalStore(inputRoot, outputRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputRoot, "input.jpg"), []byte{0xff, 0xd8, 0xff, 'i', 'n', 'p', 'u', 't'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseStates, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := &countingStateStore{base: baseStates}
+	manager := NewManager(config.Config{
+		MagickPath: magick, QueueSize: 1, JobWorkers: 1, ImageWorkers: 1, VideoWorkers: 1,
+		WorkRoot: t.TempDir(), MaxInputBytes: 1024, MaxOutputBytes: 1024,
+		MaxWidth: 100, MaxHeight: 100, MaxPixels: 10000, JobTimeout: time.Second,
+	}, store, states)
+	defer manager.Stop()
+	policy := domain.DefaultPolicy()
+	policy.GenerateThumbnail = false
+	request := domain.JobRequest{JobID: "image-write-count", Items: []domain.Item{{ID: "item", ArtifactID: "input.jpg"}}, Policy: policy}
+	if _, _, err := manager.Submit(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := baseStates.Get(context.Background(), request.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State == domain.JobCompleted {
+			if got.Result == nil || got.Result.Items[0].Status != domain.ItemSuccess {
+				t.Fatalf("unexpected image result: %+v", got.Result)
+			}
+			if got := states.PutCount(); got != 7 {
+				t.Fatalf("successful non-cache image should use one committed progress write, got %d state writes", got)
+			}
+			metrics := manager.Metrics().Prometheus()
+			for _, phase := range []string{"queue", "state_io", "detect_probe", "processing", "validation", "commit"} {
+				if !strings.Contains(metrics, `media_converter_phase_duration_seconds_count{phase="`+phase+`"} `) {
+					t.Fatalf("phase %q was not recorded:\n%s", phase, metrics)
+				}
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("image job did not complete")
+}
+
+func TestDetectMediaProbesSignatureFallbackOnce(t *testing.T) {
+	probeCalls := filepath.Join(t.TempDir(), "probe-calls")
+	ffprobe := writeJobExecutable(t, fmt.Sprintf("#!/bin/sh\nprintf x >> %q\nprintf '%s\\n'\n", probeCalls, `{"streams":[{"codec_type":"video","codec_name":"h264","width":10,"height":10,"pix_fmt":"yuv420p"}],"format":{"format_name":"mov","duration":"1"}}`))
+	store, err := storage.NewLocalStore(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(config.Config{
+		FFprobePath: ffprobe, QueueSize: 1, JobWorkers: 1, ImageWorkers: 1, VideoWorkers: 1,
+		WorkRoot: t.TempDir(), MaxInputBytes: 1024,
+	}, store, mustStateStore(t))
+	defer manager.Stop()
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, []byte("not-an-image-signature"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.detectMedia(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := os.ReadFile(probeCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(calls); got != 1 {
+		t.Fatalf("signature fallback invoked ffprobe %d times, want 1", got)
+	}
+}
+
+func mustStateStore(t *testing.T) *state.Store {
+	t.Helper()
+	store, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func writeJobExecutable(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "tool.sh")
+	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func (s *failingStateStore) Delete(ctx context.Context, jobID string) error {
@@ -231,18 +527,33 @@ func TestProcessJobLogsAndLeavesProcessingStateWhenResultPersistFails(t *testing
 	manager.queue <- request.JobID
 	defer manager.Stop()
 	deadline := time.Now().Add(2 * time.Second)
+	var got domain.JobRecord
 	for time.Now().Before(deadline) {
-		got, err := baseStates.Get(context.Background(), request.JobID)
+		got, err = baseStates.Get(context.Background(), request.JobID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got.State == domain.JobProcessing {
-			return
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	got, _ := baseStates.Get(context.Background(), request.JobID)
-	t.Fatalf("expected processing state to remain recoverable, got %+v", got)
+	if got.State != domain.JobProcessing {
+		t.Fatalf("expected processing state to remain recoverable, got %+v", got)
+	}
+	manager.Stop()
+	recovered := NewManager(config.Config{QueueSize: 1, JobWorkers: 1, ImageWorkers: 1, VideoWorkers: 1, WorkRoot: t.TempDir(), JobTimeout: time.Second}, store, baseStates)
+	defer recovered.Stop()
+	if err := recovered.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = baseStates.Get(context.Background(), request.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != domain.JobCompleted || got.Result == nil || got.Result.Items[0].Error == nil || got.Result.Items[0].Error.Code != "recovery_interrupted" {
+		t.Fatalf("persist failure was not recoverable: %+v", got)
+	}
 }
 
 func TestRecoverReconcilesCommittedArtifactWithoutReprocessing(t *testing.T) {

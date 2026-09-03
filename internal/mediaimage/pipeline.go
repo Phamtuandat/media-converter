@@ -55,9 +55,6 @@ func (p Pipeline) Process(ctx context.Context, input, output string, policy doma
 		}
 		return "", format, domain.NewError("converter_failed", "ImageMagick failed to encode JPEG", "image", false, err)
 	}
-	if _, err := p.Validate(ctx, output); err != nil {
-		return "", format, err
-	}
 	return domain.OperationNormalized, format, nil
 }
 
